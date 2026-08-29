@@ -1,0 +1,35 @@
+version: "3.8"
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql
+      MYSQL_DATABASE: reachinbox
+      MYSQL_USER: reachinbox
+      MYSQL_PASSWORD: reachinbox
+    ports: ["3306:3306"]
+    volumes: ["mysqldata:/var/lib/mysql"]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF persistence so a Redis-container restart doesn't drop delayed jobs.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redisdata:/data"]
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes: ["esdata:/usr/share/elasticsearch/data"]
+
+volumes:
+  mysqldata:
+  redisdata:
+  esdata:

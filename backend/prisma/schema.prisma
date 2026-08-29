@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// A logged-in user (Google OAuth) = a "tenant" for rate limiting / slack notifications
+model User {
+  id            String   @id @default(uuid())
+  googleId      String   @unique
+  email         String   @unique
+  name          String
+  avatarUrl     String?
+  createdAt     DateTime @default(now())
+
+  senders          Sender[]
+  scheduledEmails  ScheduledEmail[]
+  slackIntegration SlackIntegration?
+}
+
+// A "from" address / identity used to send emails. Rate limits are enforced per sender.
+model Sender {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  email     String
+  // Ethereal (or any SMTP) credentials for this sender
+  smtpHost  String
+  smtpPort  Int
+  smtpUser  String
+  smtpPass  String
+  maxPerHour Int     @default(200)
+  createdAt DateTime @default(now())
+
+  emails ScheduledEmail[]
+}
+
+enum EmailStatus {
+  scheduled
+  processing
+  sent
+  failed
+  rate_limited
+}
+
+// One row per recipient. This is the source of truth — BullMQ jobs are a thin
+// execution layer on top of this table so we can always reconcile after a restart.
+model ScheduledEmail {
+  id            String      @id @default(uuid())
+  userId        String
+  user          User        @relation(fields: [userId], references: [id])
+  senderId      String
+  sender        Sender      @relation(fields: [senderId], references: [id])
+  toEmail       String
+  subject       String
+  body          String      @db.Text
+  scheduledFor  DateTime
+  minDelayMs    Int         @default(2000)
+  status        EmailStatus @default(scheduled)
+  attempts      Int         @default(0)
+  lastError     String?
+  sentAt        DateTime?
+  bullJobId     String?     // deterministic, == this row's id — kept for traceability
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([status])
+  @@index([senderId, status])
+}
+
+model SlackIntegration {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id])
+  accessToken String
+  teamName    String
+  channelId   String?
+  webhookUrl  String?
+  createdAt   DateTime @default(now())
+}
