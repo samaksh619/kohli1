@@ -1,162 +1,159 @@
-# ReachInbox Email Job Scheduler
+# ReachInbox
 
-A production-style email scheduler: BullMQ + Redis for delayed-job scheduling
-(no cron), MySQL via Prisma for the source of truth, Ethereal SMTP for
-sending, Elasticsearch for search, a live BullMQ dashboard, Google login, and
-a Next.js dashboard for composing and tracking sends.
+ReachInbox is a full-stack email scheduling and tracking application built with a Node.js + TypeScript backend and a Next.js frontend. It lets users authenticate with Google, create email campaigns, schedule delivery, monitor queue status, and search sent mail records.
 
-## 1. Running it
+## Features
 
-### Prerequisites
-Docker + Docker Compose, Node 18+.
+- Google OAuth login and session-based authentication
+- Compose email campaigns with subject, body, and recipient list upload
+- Schedule delivery using delayed jobs with Redis and BullMQ
+- Track scheduled and sent emails in a dashboard UI
+- Enforce per-sender delay and hourly rate limits
+- Reconcile scheduled jobs on server startup
+- Search message records using Elasticsearch
+- Real Slack OAuth integration for rate-limit notifications
+- BullMQ admin dashboard for monitoring jobs
 
-### Infra
+## Tech stack
+
+- Frontend: Next.js, React, TypeScript, Tailwind CSS
+- Backend: Node.js, Express, TypeScript, Prisma, MySQL
+- Job processing: BullMQ + Redis
+- Search: Elasticsearch
+- Auth: Passport + Google OAuth
+- Infra: Docker Compose
+
+## Prerequisites
+
+- Node.js 18 or later
+- Docker and Docker Compose
+- Git
+
+## Project structure
+
+- backend: API server, Prisma models, BullMQ workers, Redis and queue logic
+- frontend: Next.js dashboard and auth UI
+- README.md: project overview and setup instructions
+
+## Local setup
+
+### 1. Start infrastructure
+
+From the project root:
+
 ```bash
 cd backend
-docker compose up -d      # mysql, redis, elasticsearch
-cp .env.example .env      # fill in GOOGLE_CLIENT_ID/SECRET, SLACK_* if you have them
-npm install
-npm run prisma:migrate    # creates tables
+docker compose up -d
 ```
 
-### Backend — two processes
+This starts:
+
+- MySQL on port 3306
+- Redis on port 6379
+- Elasticsearch on port 9200
+
+### 2. Configure backend environment
+
+Create a backend/.env file with values similar to:
+
+```env
+PORT=4000
+SESSION_SECRET=your-session-secret
+DATABASE_URL=mysql://reachinbox:reachinbox@localhost:3306/reachinbox
+REDIS_HOST=localhost
+REDIS_PORT=6379
+ELASTICSEARCH_NODE=http://localhost:9200
+ELASTIC_ENABLED=true
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+GOOGLE_CALLBACK_URL=http://localhost:4000/api/auth/google/callback
+SLACK_CLIENT_ID=your-slack-client-id
+SLACK_CLIENT_SECRET=your-slack-client-secret
+SLACK_REDIRECT_URI=http://localhost:4000/api/slack/oauth/callback
+FRONTEND_URL=http://localhost:3000
+WORKER_CONCURRENCY=5
+MIN_DELAY_BETWEEN_EMAILS_MS=2000
+MAX_EMAILS_PER_HOUR_PER_SENDER=200
+```
+
+### 3. Install dependencies and run database migrations
+
 ```bash
-npm run dev          # Express API on :4000 (also runs the boot reconciler)
-npm run worker        # BullMQ worker, separate process/terminal
+cd backend
+npm install
+npx prisma generate
+npm run prisma:migrate
 ```
-Live queue dashboard: **http://localhost:4000/admin/queues**
 
-### Frontend
+### 4. Start backend services
+
+Open two terminals:
+
+```bash
+cd backend
+npm run dev
+```
+
+```bash
+cd backend
+npm run worker
+```
+
+The API runs on http://localhost:4000 and the BullMQ dashboard is available at http://localhost:4000/admin/queues.
+
+### 5. Start the frontend
+
 ```bash
 cd frontend
-cp .env.example .env.local
 npm install
-npm run dev            # http://localhost:3000
+npm run dev
 ```
 
-### Google OAuth
-Create an OAuth Client ID in Google Cloud Console (Web application), set the
-authorized redirect URI to `http://localhost:4000/api/auth/google/callback`,
-and paste the client ID/secret into `backend/.env`.
+The app runs on http://localhost:3000.
 
-### Slack app
-Create a Slack app at api.slack.com/apps with the `incoming-webhook` and
-`chat:write` scopes, redirect URI
-`http://localhost:4000/api/slack/oauth/callback`, and paste the client
-ID/secret into `backend/.env`. Click **Connect Slack** in the dashboard header
-to run the real OAuth flow.
+## Google OAuth setup
 
-### Ethereal
-Nothing to configure — the first time you schedule an email, the backend
-auto-creates a throwaway Ethereal test account for you (`services/mailer.ts:
-createEtherealAccount`) and reuses it for that user going forward. Sent-mail
-preview links are returned by `sendMail()` and logged server-side.
+1. Go to the Google Cloud Console.
+2. Create a new OAuth client ID.
+3. Add the redirect URI:
+   http://localhost:4000/api/auth/google/callback
+4. Add the generated client ID and secret to backend/.env.
 
-## 2. Architecture
+## Slack setup
 
-### Scheduling (no cron)
-Every recipient becomes one `ScheduledEmail` row in MySQL — this table is
-the **source of truth**, not BullMQ. When a batch is scheduled, each row is
-also added to BullMQ as a **delayed job** (`queue.ts: enqueueScheduledEmail`)
-whose `jobId` is set to the row's own UUID. That deterministic ID is what
-gives us:
+1. Create a Slack app in the Slack API dashboard.
+2. Add the incoming webhook and chat:write permissions.
+3. Set the redirect URI to:
+   http://localhost:4000/api/slack/oauth/callback
+4. Add the client ID and secret to backend/.env.
 
-- **Idempotency** — adding a job with an ID that's already in the queue is a
-  no-op in BullMQ, so re-running the enqueue logic (e.g. on every server
-  boot) never creates duplicates. The worker also double-checks the DB row's
-  `status` before sending, so even a theoretical duplicate job can't send
-  the same email twice.
-- **Restart persistence** — BullMQ jobs already live in Redis, so a plain
-  Node process restart doesn't lose anything; the worker just resumes
-  consuming the queue. To also survive a Redis restart/flush, `queue/
-  reconcile.ts` runs once on API boot: it walks every DB row still in
-  `scheduled` / `processing` / `rate_limited` status, checks whether BullMQ
-  already has that job, and re-adds it if not — using the same deterministic
-  ID, so it's always safe to run.
+## Common commands
 
-### Concurrency, delay, and rate limiting (`queue/worker.ts`, `queue/limiter.ts`)
-- **Concurrency** is a single config value (`WORKER_CONCURRENCY`) passed to
-  the BullMQ `Worker` — no custom pooling needed, BullMQ handles running N
-  jobs in parallel safely.
-- **Minimum delay between sends** is enforced *per sender* with a small Lua
-  script (`limiter.ts: waitForSenderSlot`) that atomically reads-and-bumps a
-  "next allowed send time" key in Redis. This is safe under concurrent
-  workers because the read-modify-write happens as one atomic operation
-  server-side, not as a race between separate GET/SET calls.
-- **Hourly cap per sender** uses a fixed-window Redis counter
-  (`rl:{senderId}:{hourBucket}`), incremented atomically with `INCR` and
-  auto-expired. When a job would exceed the cap, it is **not** dropped: the
-  worker throws a `RateLimitedError`, the counter slot is given back, the DB
-  row is marked `rate_limited`, and a **new delayed job for the same row** is
-  scheduled for the start of the next hour window — preserving the row
-  (and therefore ordering intent) rather than failing it.
-- **Trade-off**: the hourly limiter uses a fixed window, not a true sliding
-  window, so in the worst case a sender could send close to 2x the cap
-  across a window boundary. Documented here rather than solved with a more
-  complex token-bucket, given assignment scope.
+Backend:
 
-### Slack notification
-`services/slack.ts` implements the real OAuth flow (`/api/slack/connect` →
-Slack authorize screen → `/api/slack/oauth/callback` → token + webhook URL
-stored per user). `notifyRateLimitHit` is called directly from the worker the
-moment a cap is hit, posts to the stored **incoming webhook URL** (a genuine
-HTTP call, not a log line), and de-dupes via a Redis flag keyed by
-`(user, sender, hour)` so one burst of rejected jobs produces one Slack
-message, not hundreds. If the user has never connected Slack, the function
-returns early with no error and no crash; connecting later starts working on
-the very next rate-limit event with no redeploy, since the lookup happens at
-call time.
+```bash
+cd backend
+npm run dev
+npm run worker
+npm run build
+```
 
-### Search (Elasticsearch)
-Every send success indexes a document into an `emails` index
-(`services/elastic.ts`). `GET /api/emails/search?q=...` does a multi-match
-across subject/body/recipient, scoped to the logged-in user. Elasticsearch is
-treated as optional infrastructure — indexing failures are caught and logged,
-never allowed to fail an actual send.
+Frontend:
 
-### 1000+ emails at once
-Scheduling a batch creates N DB rows and N BullMQ delayed jobs in a loop —
-BullMQ/Redis comfortably queues tens of thousands of delayed jobs. Actual
-throughput is governed entirely by `WORKER_CONCURRENCY` × the per-sender
-delay/hourly-cap logic above, so a 1000-recipient batch scheduled "now" will
-fan out over time rather than trying to send all 1000 in the same second.
+```bash
+cd frontend
+npm run dev
+npm run build
+npm run lint
+```
 
-## 3. Feature checklist
+## Notes
 
-**Backend**
-- [x] API-driven scheduling → BullMQ delayed jobs (no cron)
-- [x] MySQL (Prisma) as source of truth for every scheduled/sent email
-- [x] Multi-sender Ethereal SMTP sending
-- [x] Elasticsearch indexing + search endpoint
-- [x] Live BullMQ dashboard at `/admin/queues` (bull-board)
-- [x] Restart persistence via deterministic job IDs + boot-time reconciler
-- [x] Configurable worker concurrency
-- [x] Configurable per-sender minimum delay (Redis-atomic)
-- [x] Configurable, Redis-backed hourly rate limit per sender, reschedules
-      instead of dropping on breach
-- [x] Real Slack OAuth + live webhook call on rate-limit hit, silent no-op
-      when disconnected
-- [x] Idempotent sends (DB status check + deterministic job IDs)
+- The backend uses Prisma with MySQL as the source of truth for scheduled jobs.
+- Redis and BullMQ power the delayed job flow and worker processing.
+- Elasticsearch is used for search indexing and query operations.
+- The project is designed for local development and assignment-style demo execution.
 
-**Frontend**
-- [x] Real Google OAuth login, header shows name/email/avatar, logout
-- [x] Scheduled / Sent tabs + Compose button
-- [x] Compose modal: subject, body, CSV/text lead upload with detected-count,
-      start time, delay, hourly limit
-- [x] Scheduled & Sent tables with loading and empty states
-- [x] Reusable table/badge/modal components, typed API layer
+## License
 
-## 4. Assumptions & shortcuts
-
-- A "sender" is auto-provisioned (a throwaway Ethereal account) the first
-  time a user schedules an email, rather than building a full sender-
-  management UI — the backend model (`Sender`) supports multiple real senders
-  per user, but the frontend only exposes the one auto-created sender for
-  this assignment.
-- The compose modal spreads `scheduledFor` timestamps across recipients by
-  the chosen delay so the dashboard reflects intent accurately, but the
-  *actual* throttling guarantee comes from the worker's Redis-atomic
-  per-sender delay — the two are deliberately decoupled.
-- Fixed-window (not sliding-window) hourly rate limiting — see trade-off note
-  above.
-- No refresh-token/session-expiry UI beyond a basic cookie session.
+This project is provided as-is for educational and assignment use.
